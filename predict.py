@@ -205,7 +205,7 @@ class Predictor(BasePredictor):
     def predict(
         self,
         prompt: str = Input(
-            default="A modern lounge in lush greenery.",
+            default="",
             description="The text prompt describing your video scene.",
         ),
         lora_url: str = Input(
