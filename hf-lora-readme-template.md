@@ -12,6 +12,11 @@ tags:
 - replicate
 base_model: "tencent/HunyuanVideo"
 pipeline_tag: text-to-video
+# widget:
+#   - text: >-
+#       prompt
+#     output:
+#       url: https://...
 ---
 
 # [title]
