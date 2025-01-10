@@ -66,6 +66,33 @@ def train(
         default="sigmoid",
         choices=["sigma", "uniform", "sigmoid", "shift"],
     ),
+    consecutive_target_frames: str = Input(
+        description="The lengths of consecutive frames to extract. Each integer represents how many consecutive frames to extract using the frame extraction method. For example, '1, 13, 25' will create three separate extractions of 1 frame, 13 frames, and 25 consecutive frames.",
+        default="[1, 25, 45]",
+        choices=[
+            "[1, 13, 25]",
+            "[1, 25, 45]",
+            "[1, 45, 89]",
+            "[1, 13, 25, 45]",
+        ],
+    ),
+    frame_extraction_method: str = Input(
+        description="Method to extract frames from videos during training. 'head': takes first N frames, 'chunk': splits video into N-frame chunks, 'slide': extracts frames with fixed stride, 'uniform': samples N evenly-spaced frames.",
+        default="head",
+        choices=["head", "chunk", "slide", "uniform"],
+    ),
+    frame_stride: int = Input(
+        description="Frame stride for 'slide' extraction method. This represents the number of frames to advance when extracting each sequence of frames, where a sequence is typically longer than the stride value (e.g., extracting 13 frames with stride 10), resulting in overlapping segments of frames. For example, with a 13-frame sequence and stride of 10, each new sequence would share 3 frames with the previous sequence.",
+        default=10,
+        ge=1,
+        le=100,
+    ),
+    frame_sample: int = Input(
+        description="Number of samples for 'uniform' extraction method.",
+        default=4,
+        ge=1,
+        le=20,
+    ),
     seed: int = Input(
         description="Random seed (use <=0 for a random pick).",
         default=0,
@@ -89,7 +116,9 @@ def train(
     clean_up()
     download_weights()
     seed = handle_seed(seed)
-    create_train_toml()
+    create_train_toml(
+        consecutive_target_frames, frame_extraction_method, frame_stride, frame_sample
+    )
     extract_zip(input_videos, INPUT_DIR)
     cache_latents()
     cache_text_encoder_outputs(batch_size)
@@ -124,12 +153,23 @@ def handle_seed(seed: int) -> int:
     return seed
 
 
-def create_train_toml():
+def create_train_toml(
+    consecutive_target_frames: str,
+    frame_extraction_method: str,
+    frame_stride: int,
+    frame_sample: int,
+):
     """Create train.toml configuration file"""
     print("Creating train.toml...")
     with open("train.toml", "w") as f:
-        f.write(
-            """[general]
+        target_frames = consecutive_target_frames
+        if frame_extraction_method == "chunk":
+            # Strip out 1 from target frames for chunk extraction
+            target_frames = consecutive_target_frames
+            if target_frames.startswith("[1, "):
+                target_frames = "[" + target_frames[4:]
+
+        config = f"""[general]
 resolution = [960, 544]
 caption_extension = ".txt"
 batch_size = 1
@@ -139,10 +179,17 @@ bucket_no_upscale = false
 [[datasets]]
 video_directory = "./input/videos"
 cache_directory = "./input/cache_directory"
-target_frames = [1, 25, 45]
-frame_extraction = "head"
+target_frames = {target_frames}
+frame_extraction = "{frame_extraction_method}"
 """
-        )
+        if frame_extraction_method == "slide":
+            config += f"frame_stride = {frame_stride}\n"
+        elif frame_extraction_method == "uniform":
+            config += f"frame_sample = {frame_sample}\n"
+        f.write(config)
+        print("Training config:\n==================\n")
+        print(config)
+        print("\n==================\n")
 
 
 def cache_latents():

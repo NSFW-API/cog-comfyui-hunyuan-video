@@ -14,6 +14,7 @@ __pycache__
 weights.txt
 manifest.txt
 updated_weights.json
+hunyuan-lora-for-hf/
 downloaded_user_models/
 .cog
 /ckpts/
