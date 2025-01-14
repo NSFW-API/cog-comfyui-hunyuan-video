@@ -99,6 +99,7 @@ def train(
     ),
     hf_repo_id: str = Input(
         description="Hugging Face repository ID, if you'd like to upload the trained LoRA to Hugging Face. For example, lucataco/flux-dev-lora. If the given repo does not exist, a new public repo will be created.",
+        default=None,
     ),
     hf_token: Secret = Input(
         description="Hugging Face token, if you'd like to upload the trained LoRA to Hugging Face.",
@@ -331,11 +332,14 @@ def download_weights():
         if not os.path.exists(dest_path):
             url = BASE_URL + model_file
             print(f"Downloading {url} to {MODEL_CACHE}")
-            subprocess.check_call(["pget", "-xvf", url, MODEL_CACHE])
+            subprocess.check_call(["pget", "-xf", url, MODEL_CACHE])
 
 
 def extract_zip(zip_path: Path, extraction_dir: str):
-    """Extract videos & .txt captions from the provided zip."""
+    """Extract videos & .txt captions from the provided zip
+    and flatten any nested folder structure so that all
+    .mp4 and .txt files end up under extraction_dir/videos.
+    """
     if not is_zipfile(zip_path):
         raise ValueError("The provided input_videos must be a zip file.")
 
@@ -343,17 +347,68 @@ def extract_zip(zip_path: Path, extraction_dir: str):
     final_videos_path = os.path.join(extraction_dir, "videos")
     os.makedirs(final_videos_path, exist_ok=True)
 
+    # Track what we find for validation
+    video_files = set()
+    caption_files = set()
+
     file_count = 0
     with ZipFile(zip_path, "r") as zip_ref:
         for file_info in zip_ref.infolist():
-            # skip Mac hidden system files
+            # Skip hidden Mac system files/folders
             if not file_info.filename.startswith(
                 "__MACOSX/"
             ) and not file_info.filename.startswith("._"):
+                # Get just the filename without path
+                base_name = os.path.basename(file_info.filename)
+                if base_name:  # Skip if it's a directory
+                    if base_name.endswith(".mp4"):
+                        video_files.add(os.path.splitext(base_name)[0])
+                    elif base_name.endswith(".txt"):
+                        caption_files.add(os.path.splitext(base_name)[0])
+
                 zip_ref.extract(file_info, final_videos_path)
                 file_count += 1
 
-    print(f"Extracted {file_count} total files to: {final_videos_path}")
+    # Flatten all subdirectories into final_videos_path
+    for root, dirs, files in os.walk(final_videos_path):
+        if root == final_videos_path:
+            continue
+        for f in files:
+            old_path = os.path.join(root, f)
+            new_path = os.path.join(final_videos_path, f)
+            shutil.move(old_path, new_path)
+
+    # Clean up empty directories
+    for root, dirs, files in os.walk(final_videos_path, topdown=False):
+        if root != final_videos_path:
+            try:
+                os.rmdir(root)
+            except OSError:
+                pass
+
+    # Validate we have matching pairs
+    videos_without_captions = video_files - caption_files
+    captions_without_videos = caption_files - video_files
+    if videos_without_captions:
+        print(
+            f"Warning: Found videos without matching captions: {videos_without_captions}"
+        )
+    if captions_without_videos:
+        print(
+            f"Warning: Found captions without matching videos: {captions_without_videos}"
+        )
+
+    if not video_files:
+        raise ValueError("No video files found in zip!")
+    if not caption_files:
+        raise ValueError("No caption files found in zip!")
+    if not (video_files & caption_files):
+        raise ValueError(
+            "No matching video-caption pairs found! Make sure filenames match (e.g., video.mp4 and video.txt)"
+        )
+
+    print(f"Extracted {file_count} total files (flattened) to: {final_videos_path}")
+    print(f"Found {len(video_files & caption_files)} valid video-caption pairs")
 
 
 def handle_hf_upload(hf_repo_id: str, hf_token: Secret):
