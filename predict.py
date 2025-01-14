@@ -22,7 +22,8 @@ ALL_DIRECTORIES = [OUTPUT_DIR, INPUT_DIR, COMFYUI_TEMP_OUTPUT_DIR]
 mimetypes.add_type("video/mp4", ".mp4")
 mimetypes.add_type("video/quicktime", ".mov")
 
-api_json_file = "t2v-lora.json"
+# Use the updated JSON file:
+api_json_file = "t2v-lora-updated.json"
 
 # Ensure HF Hub is online for LoRA downloads
 if "HF_HUB_OFFLINE" in os.environ:
@@ -137,7 +138,7 @@ class Predictor(BasePredictor):
         """
         lora_dir = os.path.join("ComfyUI", "models", "loras")
         os.makedirs(lora_dir, exist_ok=True)
-        # TODO: add starts w data:
+
         with tempfile.TemporaryDirectory() as temp_dir:
             with tarfile.open(str(replicate_weights), "r:*") as tar:
                 tar.extractall(path=temp_dir)
@@ -172,9 +173,15 @@ class Predictor(BasePredictor):
         lora_strength: float,
         frame_rate: int,
         crf: int,
+        enhance_weight: float,
+        enhance_single: bool,
+        enhance_double: bool,
+        enhance_start: float,
+        enhance_end: float,
+        scheduler: str,
     ):
         """
-        Update the t2v-lora.json workflow with user-selected parameters.
+        Update the t2v-lora-updated.json workflow with user-selected parameters.
         """
         # Node 3: HyVideoSampler
         workflow["3"]["inputs"]["width"] = width
@@ -186,6 +193,7 @@ class Predictor(BasePredictor):
         workflow["3"]["inputs"]["force_offload"] = 1 if force_offload else 0
         workflow["3"]["inputs"]["denoise_strength"] = denoise_strength
         workflow["3"]["inputs"]["num_frames"] = num_frames
+        workflow["3"]["inputs"]["scheduler"] = scheduler
 
         # Node 30: HyVideoTextEncode
         workflow["30"]["inputs"]["prompt"] = prompt
@@ -202,65 +210,155 @@ class Predictor(BasePredictor):
         workflow["34"]["inputs"]["crf"] = crf
         workflow["34"]["inputs"]["save_output"] = True
 
+        # Node 42: HyVideoEnhanceAVideo
+        workflow["42"]["inputs"]["weight"] = enhance_weight
+        workflow["42"]["inputs"]["single_blocks"] = enhance_single
+        workflow["42"]["inputs"]["double_blocks"] = enhance_double
+        workflow["42"]["inputs"]["start_percent"] = enhance_start
+        workflow["42"]["inputs"]["end_percent"] = enhance_end
+
     def predict(
         self,
+        # -------------------------------------------
+        # 1. PROMPT & LoRA
+        # -------------------------------------------
         prompt: str = Input(
             default="",
             description="The text prompt describing your video scene.",
         ),
         lora_url: str = Input(
             default="",
-            description="A URL pointing to your LoRA .safetensors file or a Hugging Face repo (e.g. 'user/repo' - will use first .safetensors found).",
-        ),
-        replicate_weights: Path = Input(
-            default=None,
-            description="A tar file containing LoRA weights from replicate. (Optional)",
+            description="A URL pointing to your LoRA .safetensors file or a Hugging Face repo (e.g. 'user/repo' - uses the first .safetensors file).",
         ),
         lora_strength: float = Input(
-            default=1.0, description="Scale/strength for your LoRA."
+            default=1.0,
+            ge=-10.0,
+            le=10.0,
+            description="Scale/strength for your LoRA.",
         ),
-        width: int = Input(
-            default=640, ge=64, le=1536, description="Width for the generated video."
-        ),
-        height: int = Input(
-            default=360, ge=64, le=1024, description="Height for the generated video."
+        # -------------------------------------------
+        # 2. SAMPLING CONTROLS
+        # -------------------------------------------
+        scheduler: str = Input(
+            default="DPMSolverMultistepScheduler",
+            choices=[
+                "FlowMatchDiscreteScheduler",
+                "SDE-DPMSolverMultistepScheduler",
+                "DPMSolverMultistepScheduler",
+                "SASolverScheduler",
+                "UniPCMultistepScheduler",
+            ],
+            description="Algorithm used to generate the video frames.",
         ),
         steps: int = Input(
-            default=50, ge=1, le=150, description="Number of diffusion steps."
+            default=50,
+            ge=1,
+            le=150,
+            description="Number of diffusion steps.",
         ),
         guidance_scale: float = Input(
-            default=6.0, description="Overall influence of text vs. model."
+            default=6.0,
+            ge=0.0,
+            le=30.0,
+            description="Overall influence of text vs. model.",
         ),
         flow_shift: int = Input(
-            default=9, ge=0, le=20, description="Video continuity factor (flow)."
+            default=9,
+            ge=0,
+            le=20,
+            description="Video continuity factor (flow).",
         ),
-        force_offload: bool = Input(
-            default=True, description="Whether to force model layers offloaded to CPU."
-        ),
-        denoise_strength: float = Input(
-            default=1.0, description="Controls how strongly noise is applied each step."
-        ),
+        # -------------------------------------------
+        # 3. VIDEO DIMENSIONS & FRAMES
+        # -------------------------------------------
         num_frames: int = Input(
-            default=85,
+            default=33,
             ge=1,
-            le=300,
+            le=1440,
             description="How many frames (duration) in the resulting video.",
         ),
+        width: int = Input(
+            default=640,
+            ge=64,
+            le=1536,
+            description="Width for the generated video.",
+        ),
+        height: int = Input(
+            default=360,
+            ge=64,
+            le=1024,
+            description="Height for the generated video.",
+        ),
+        # -------------------------------------------
+        # 4. ADVANCED CONTROLS
+        # -------------------------------------------
+        denoise_strength: float = Input(
+            default=1.0,
+            ge=0.0,
+            le=2.0,
+            description="Controls how strongly noise is applied each step.",
+        ),
+        force_offload: bool = Input(
+            default=True,
+            description="Whether to force model layers offloaded to CPU.",
+        ),
+        # -------------------------------------------
+        # 5. OUTPUT ENCODING
+        # -------------------------------------------
         frame_rate: int = Input(
-            default=24, ge=1, le=60, description="Video frame rate."
+            default=16,
+            ge=1,
+            le=60,
+            description="Video frame rate.",
         ),
         crf: int = Input(
             default=19,
             ge=0,
             le=51,
-            description="CRF (quality) for h264 video encoding, lower=better.",
+            description="CRF (quality) for H264 encoding. Lower values = higher quality.",
         ),
+        # -------------------------------------------
+        # 6. POST-PROCESS ENHANCING
+        # -------------------------------------------
+        enhance_weight: float = Input(
+            default=0.3,
+            ge=0.0,
+            le=2.0,
+            description="Strength of the video enhancement effect.",
+        ),
+        enhance_single: bool = Input(
+            default=True,
+            description="Apply enhancement to individual frames.",
+        ),
+        enhance_double: bool = Input(
+            default=True,
+            description="Apply enhancement across frame pairs.",
+        ),
+        enhance_start: float = Input(
+            default=0.0,
+            ge=0.0,
+            le=1.0,
+            description="When to start enhancement in the video. Must be less than enhance_end.",
+        ),
+        enhance_end: float = Input(
+            default=1.0,
+            ge=0.0,
+            le=1.0,
+            description="When to end enhancement in the video. Must be greater than enhance_start.",
+        ),
+        # -------------------------------------------
+        # 7. REPRODUCIBILITY: SEED
+        # -------------------------------------------
         seed: int = seed_helper.predict_seed(),
+        replicate_weights: Path = Input(
+            default=None,
+            description="A .tar file containing LoRA weights from replicate.",
+        ),
     ) -> Path:
         """
         Create a video using HunyuanVideo with either:
-         - replicate_weights tar (preferred if provided)
-         - a direct lora_url (HTTP link or Hugging Face repo ID)
+          • replicate_weights tar (preferred if provided)
+          • a direct lora_url (HTTP link or Hugging Face repo ID)
         """
         # Convert user seed to a valid integer
         seed = seed_helper.generate(seed)
@@ -280,7 +378,7 @@ class Predictor(BasePredictor):
                 )
             lora_name = self.copy_lora_file(lora_url)
 
-        # 3. Load the main workflow JSON
+        # 3. Load the updated workflow JSON
         with open(api_json_file, "r") as f:
             workflow = json.loads(f.read())
 
@@ -304,6 +402,12 @@ class Predictor(BasePredictor):
             lora_strength=0.0,  # skip real strength
             frame_rate=frame_rate,
             crf=crf,
+            enhance_weight=enhance_weight,
+            enhance_single=enhance_single,
+            enhance_double=enhance_double,
+            enhance_start=enhance_start,
+            enhance_end=enhance_end,
+            scheduler=scheduler,
         )
 
         # 5. Load the workflow -> handle_weights sees lora="", won't attempt a download

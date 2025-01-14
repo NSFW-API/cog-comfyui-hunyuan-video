@@ -53,3 +53,6 @@ ComfyUI/comfyui_screenshot.png
 
 # Musubi-tuner
 /ckpts/*
+/overfit_to_one_video
+/luis-dataset
+/*.zip
