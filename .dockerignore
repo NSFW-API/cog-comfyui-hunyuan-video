@@ -57,3 +57,6 @@ ComfyUI/comfyui_screenshot.png
 /qwen_checkpoints
 /luis-dataset
 /*.zip
+/input
+/output
+/hunyuan-lora-for-hf

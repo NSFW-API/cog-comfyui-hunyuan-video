@@ -115,12 +115,8 @@ def train(
         default="adamw8bit",
         choices=["adamw", "adamw8bit", "AdaFactor", "adamw16bit"],
     ),
-    gradient_checkpointing: bool = Input(
-        description="Enable gradient checkpointing to reduce memory usage. Turn this on if you run out of memory.",
-        default=True,
-    ),
     timestep_sampling: str = Input(
-        description="Method to sample timesteps for training.",
+        description="Controls how timesteps are sampled during training. 'sigmoid' (default) concentrates samples in the middle of the diffusion process. 'uniform' samples evenly across all timesteps. 'sigma' samples based on the noise schedule. 'shift' uses shifted sampling with discrete flow shift. If unsure, use 'sigmoid'.",
         default="sigmoid",
         choices=["sigma", "uniform", "sigmoid", "shift"],
     ),
@@ -173,7 +169,6 @@ def train(
     print(f"    - LoRA Rank: {rank}")
     print(f"    - Learning Rate: {learning_rate}")
     print(f"    - Batch Size: {batch_size}")
-    print(f"    - Gradient Checkpointing: {gradient_checkpointing}")
     if autocaption:
         print(f"  • Auto-captioning:")
         print(f"    - Enabled: {autocaption}")
@@ -212,7 +207,6 @@ def train(
         learning_rate,
         timestep_sampling,
         seed,
-        gradient_checkpointing,
     )
     convert_lora_to_comfyui_format()
     output_path = archive_results()
@@ -323,17 +317,17 @@ def run_lora_training(
     learning_rate: float,
     timestep_sampling: str,
     seed: int,
-    gradient_checkpointing: bool,
 ):
     """Run LoRA training"""
     print("\n=== 🚀 Starting LoRA Training ===")
     print(f"• Epochs: {epochs}")
     print("=====================================")
+
     training_args = [
         "accelerate",
         "launch",
         "--num_cpu_threads_per_process",
-        "1",
+        "8",
         "--mixed_precision",
         "bf16",
         "musubi-tuner/hv_train_network.py",
@@ -344,7 +338,7 @@ def run_lora_training(
         ),
         "--dataset_config",
         "train.toml",
-        "--sdpa",
+        "--flash_attn",
         "--mixed_precision",
         "bf16",
         "--fp8_base",
@@ -353,7 +347,7 @@ def run_lora_training(
         "--learning_rate",
         str(learning_rate),
         "--max_data_loader_n_workers",
-        "2",
+        "16",
         "--persistent_data_loader_workers",
         "--network_module",
         "networks.lora",
@@ -371,9 +365,8 @@ def run_lora_training(
         OUTPUT_DIR,
         "--output_name",
         "lora",
+        "--gradient_checkpointing",
     ]
-    if gradient_checkpointing:
-        training_args.append("--gradient_checkpointing")
 
     subprocess.run(training_args, check=True)
     print("\n✨ Training Complete!")
@@ -409,8 +402,7 @@ def convert_lora_to_comfyui_format():
 def archive_results() -> str:
     """Archive final results and return output path"""
     print("\n=== 📦 Archiving Results ===")
-    output_path = "trained_model.tar"
-    # output_path = "/tmp/trained_model.tar"
+    output_path = "/tmp/trained_model.tar"
 
     print(f"Archiving LoRA outputs to {output_path}")
     os.system(f"tar -cvf {output_path} -C {OUTPUT_DIR} .")
