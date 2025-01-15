@@ -6,6 +6,42 @@ import time
 from zipfile import ZipFile, is_zipfile
 from huggingface_hub import HfApi
 from cog import BaseModel, Input, Path, Secret
+from typing import Optional
+import logging
+
+
+# Configure logging to suppress INFO messages
+logging.basicConfig(level=logging.WARNING, format="%(message)s")
+
+# Suppress all common loggers
+loggers_to_quiet = [
+    "torch",
+    "accelerate",
+    "transformers",
+    "__main__",
+    "dataset",
+    "networks",
+    "hunyuan_model",
+    "PIL",
+    "qwen_vl_utils",
+    "huggingface_hub",
+    "diffusers",
+    "filelock",
+    "safetensors",
+    "xformers",
+    "datasets",
+    "tokenizers",
+    "sageattention",
+]
+
+for logger_name in loggers_to_quiet:
+    logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+# Suppress third-party warnings
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 # We return a path to our tarred LoRA weights at the end
@@ -32,40 +68,55 @@ sys.path.append("musubi-tuner")
 
 def train(
     input_videos: Path = Input(
-        description="A zip file containing videos and (optionally) .txt captions. If no captions (or partial), auto-caption if autocaption=True.",
+        description="A zip file containing videos that will be used for training. If you include captions, include them as one .txt file per video, e.g. my-video.mp4 should have a caption file named my-video.txt. If you don't include captions, you can use autocaptioning (enabled by default).",
+        default=None,
+    ),
+    trigger_word: str = Input(
+        description="The trigger word refers to the object, style or concept you are training on. Pick a string that isn't a real word, like TOK or something related to what's being trained, like STYLE3D. The trigger word you specify here will be associated with all videos during training. Then when you use your LoRA, you can include the trigger word in prompts to help activate the LoRA.",
+        default="TOK",
+    ),
+    autocaption: bool = Input(
+        description="Automatically caption videos using QWEN-VL", default=True
+    ),
+    autocaption_prefix: str = Input(
+        description="Optional: Text you want to appear at the beginning of all your generated captions; for example, 'a video of TOK, '. You can include your trigger word in the prefix. Prefixes help set the right context for your captions.",
+        default=None,
+    ),
+    autocaption_suffix: str = Input(
+        description="Optional: Text you want to appear at the end of all your generated captions; for example, ' in the style of TOK'. You can include your trigger word in suffixes. Suffixes help set the right concept for your captions.",
         default=None,
     ),
     epochs: int = Input(
-        description="Number of training epochs (each ~1 pass).",
+        description="Number of training epochs. Each epoch is approximately one pass through your videos.",
         default=16,
         ge=1,
         le=2000,
     ),
     rank: int = Input(
-        description="LoRA rank for Hunyuan training.",
+        description="LoRA rank for training. Higher ranks take longer to train but can capture more complex features. Caption quality is more important for higher ranks.",
         default=32,
         ge=1,
         le=128,
     ),
     batch_size: int = Input(
-        description="Batch size for training",
+        description="Batch size for training. Lower values use less memory but train slower.",
         default=4,
         ge=1,
         le=8,
     ),
     learning_rate: float = Input(
-        description="Learning rate for training.",
+        description="Learning rate for training. If you're new to training you probably don't need to change this.",
         default=1e-3,
         ge=1e-5,
         le=1,
     ),
     optimizer: str = Input(
-        description="Optimizer type",
+        description="Optimizer type for training. If you're unsure, leave as default.",
         default="adamw8bit",
         choices=["adamw", "adamw8bit", "AdaFactor", "adamw16bit"],
     ),
     gradient_checkpointing: bool = Input(
-        description="Enable gradient checkpointing to reduce memory usage.",
+        description="Enable gradient checkpointing to reduce memory usage. Turn this on if you run out of memory.",
         default=True,
     ),
     timestep_sampling: str = Input(
@@ -74,7 +125,7 @@ def train(
         choices=["sigma", "uniform", "sigmoid", "shift"],
     ),
     consecutive_target_frames: str = Input(
-        description="The lengths of consecutive frames to extract. Each integer represents how many consecutive frames to extract using the frame extraction method. For example, '1, 13, 25' will create three separate extractions of 1 frame, 13 frames, and 25 consecutive frames.",
+        description="The lengths of consecutive frames to extract from each video.",
         default="[1, 25, 45]",
         choices=[
             "[1, 13, 25]",
@@ -84,12 +135,12 @@ def train(
         ],
     ),
     frame_extraction_method: str = Input(
-        description="Method to extract frames from videos during training. 'head': takes first N frames, 'chunk': splits video into N-frame chunks, 'slide': extracts frames with fixed stride, 'uniform': samples N evenly-spaced frames.",
+        description="Method to extract frames from videos during training.",
         default="head",
         choices=["head", "chunk", "slide", "uniform"],
     ),
     frame_stride: int = Input(
-        description="Frame stride for 'slide' extraction method. This represents the number of frames to advance when extracting each sequence of frames, where a sequence is typically longer than the stride value (e.g., extracting 13 frames with stride 10), resulting in overlapping segments of frames. For example, with a 13-frame sequence and stride of 10, each new sequence would share 3 frames with the previous sequence.",
+        description="Frame stride for 'slide' extraction method.",
         default=10,
         ge=1,
         le=100,
@@ -101,15 +152,11 @@ def train(
         le=20,
     ),
     seed: int = Input(
-        description="Random seed (use <=0 for a random pick).",
+        description="Random seed for training. Use <=0 for random.",
         default=0,
     ),
-    autocaption: bool = Input(
-        description="If True, generate captions for any video missing a .txt file.",
-        default=True,
-    ),
     hf_repo_id: str = Input(
-        description="Hugging Face repository ID, if you'd like to upload the trained LoRA to Hugging Face. For example, lucataco/flux-dev-lora. If the given repo does not exist, a new public repo will be created.",
+        description="Hugging Face repository ID, if you'd like to upload the trained LoRA to Hugging Face. For example, username/my-video-lora. If the given repo does not exist, a new public repo will be created.",
         default=None,
     ),
     hf_token: Secret = Input(
@@ -117,9 +164,25 @@ def train(
         default=None,
     ),
 ) -> TrainingOutput:
-    """
-    Minimal Hunyuan LoRA training script using musubi-tuner, with optional auto-captioning.
-    """
+    """Minimal Hunyuan LoRA training script using musubi-tuner"""
+    print("\n=== 🎥 Hunyuan Video LoRA Training ===")
+    print(f"📊 Configuration:")
+    print(f"  • Input: {input_videos}")
+    print(f"  • Training:")
+    print(f"    - Epochs: {epochs}")
+    print(f"    - LoRA Rank: {rank}")
+    print(f"    - Learning Rate: {learning_rate}")
+    print(f"    - Batch Size: {batch_size}")
+    print(f"    - Gradient Checkpointing: {gradient_checkpointing}")
+    if autocaption:
+        print(f"  • Auto-captioning:")
+        print(f"    - Enabled: {autocaption}")
+        print(f"    - Trigger Word: {trigger_word}")
+        if autocaption_prefix:
+            print(f"    - Prefix: {autocaption_prefix}")
+        if autocaption_suffix:
+            print(f"    - Suffix: {autocaption_suffix}")
+    print("=====================================\n")
 
     if not input_videos:
         raise ValueError(
@@ -132,7 +195,14 @@ def train(
     create_train_toml(
         consecutive_target_frames, frame_extraction_method, frame_stride, frame_sample
     )
-    extract_zip(input_videos, INPUT_DIR, autocaption=autocaption)
+    extract_zip(
+        input_videos,
+        INPUT_DIR,
+        autocaption=autocaption,
+        trigger_word=trigger_word,
+        autocaption_prefix=autocaption_prefix,
+        autocaption_suffix=autocaption_suffix,
+    )
     cache_latents()
     cache_text_encoder_outputs(batch_size)
     run_lora_training(
@@ -173,7 +243,7 @@ def create_train_toml(
     frame_sample: int,
 ):
     """Create train.toml configuration file"""
-    print("Creating train.toml...")
+    print("\n=== 📝 Creating Training Configuration ===")
     with open("train.toml", "w") as f:
         target_frames = consecutive_target_frames
         if frame_extraction_method == "chunk":
@@ -203,10 +273,13 @@ frame_extraction = "{frame_extraction_method}"
         print("Training config:\n==================\n")
         print(config)
         print("\n==================\n")
+    print("✅ Configuration file created")
+    print("=====================================")
 
 
 def cache_latents():
     """Cache latents using musubi-tuner"""
+    print("\n=== 💾 Caching Video Latents ===")
     latent_args = [
         "python",
         "musubi-tuner/cache_latents.py",
@@ -219,10 +292,13 @@ def cache_latents():
         "--vae_tiling",
     ]
     subprocess.run(latent_args, check=True)
+    print("✅ Latents cached successfully")
+    print("=====================================")
 
 
 def cache_text_encoder_outputs(batch_size: int):
     """Cache text encoder outputs"""
+    print("\n=== 💭 Caching Text Encodings ===")
     text_encoder_args = [
         "python",
         "musubi-tuner/cache_text_encoder_outputs.py",
@@ -236,6 +312,8 @@ def cache_text_encoder_outputs(batch_size: int):
         str(batch_size),
     ]
     subprocess.run(text_encoder_args, check=True)
+    print("✅ Text encodings cached")
+    print("=====================================")
 
 
 def run_lora_training(
@@ -248,7 +326,9 @@ def run_lora_training(
     gradient_checkpointing: bool,
 ):
     """Run LoRA training"""
-    print("Running LoRA training...")
+    print("\n=== 🚀 Starting LoRA Training ===")
+    print(f"• Epochs: {epochs}")
+    print("=====================================")
     training_args = [
         "accelerate",
         "launch",
@@ -296,10 +376,13 @@ def run_lora_training(
         training_args.append("--gradient_checkpointing")
 
     subprocess.run(training_args, check=True)
+    print("\n✨ Training Complete!")
+    print("=====================================")
 
 
 def convert_lora_to_comfyui_format():
     """Convert LoRA to ComfyUI-compatible format"""
+    print("\n=== 🔄 Converting LoRA Format ===")
     original_lora_path = os.path.join(OUTPUT_DIR, "lora.safetensors")
     if os.path.exists(original_lora_path):
         converted_lora_path = os.path.join(OUTPUT_DIR, "lora_comfyui.safetensors")
@@ -318,14 +401,21 @@ def convert_lora_to_comfyui_format():
         ]
         subprocess.run(convert_args, check=True)
     else:
-        print("Warning: lora.safetensors not found, skipping conversion.")
+        print("⚠️  Warning: lora.safetensors not found, skipping conversion.")
+    print("✅ Converted to ComfyUI format")
+    print("=====================================")
 
 
 def archive_results() -> str:
     """Archive final results and return output path"""
-    output_path = "/tmp/trained_model.tar"
+    print("\n=== 📦 Archiving Results ===")
+    output_path = "trained_model.tar"
+    # output_path = "/tmp/trained_model.tar"
+
     print(f"Archiving LoRA outputs to {output_path}")
     os.system(f"tar -cvf {output_path} -C {OUTPUT_DIR} .")
+    print(f"✅ Results archived to: {output_path}")
+    print("=====================================")
     return output_path
 
 
@@ -348,32 +438,45 @@ def download_weights():
             subprocess.check_call(["pget", "-xf", url, MODEL_CACHE])
 
 
-def autocaption_videos(videos_path: str, video_files: set, caption_files: set) -> set:
+def autocaption_videos(
+    videos_path: str,
+    video_files: set,
+    caption_files: set,
+    trigger_word: Optional[str] = None,
+    autocaption_prefix: Optional[str] = None,
+    autocaption_suffix: Optional[str] = None,
+) -> set:
     """Generate captions for videos that don't have matching .txt files."""
     videos_without_captions = video_files - caption_files
     if not videos_without_captions:
         return caption_files
 
-    print("Auto-captioning videos missing .txt files...")
+    print("\n=== 🤖 Auto-captioning Videos ===")
+    print(f"Found {len(videos_without_captions)} videos without captions")
     model, processor = setup_qwen_model()
-    
+
     new_caption_files = caption_files.copy()
-    for vid_name in videos_without_captions:
+    for i, vid_name in enumerate(videos_without_captions, 1):
         mp4_path = os.path.join(videos_path, vid_name + ".mp4")
         if os.path.exists(mp4_path):
-            print(f"\nProcessing video: {mp4_path}")
-            
-            # Use absolute path without file:// prefix
+            print(f"\n[{i}/{len(videos_without_captions)}] 🎥 {vid_name}.mp4")
+
+            # Use absolute path
             abs_path = os.path.abspath(mp4_path)
-            
-            # Prepare messages format
+
+            # Build caption components
+            prefix = f"{autocaption_prefix.strip()} " if autocaption_prefix else ""
+            suffix = f" {autocaption_suffix.strip()}" if autocaption_suffix else ""
+            trigger = f"{trigger_word} " if trigger_word else ""
+
+            # Prepare messages format with customized prompt
             messages = [
                 {
                     "role": "user",
                     "content": [
                         {
                             "type": "video",
-                            "video": abs_path,  # Remove file:// prefix
+                            "video": abs_path,
                         },
                         {
                             "type": "text",
@@ -382,16 +485,18 @@ def autocaption_videos(videos_path: str, video_files: set, caption_files: set) -
                     ],
                 }
             ]
-            
+
             # Process inputs
-            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            print("\nPrompt template:", text)
-            
+            text = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+
             try:
                 # Import qwen utils here to avoid circular imports
                 from qwen_vl_utils import process_vision_info
+
                 image_inputs, video_inputs = process_vision_info(messages)
-                
+
                 inputs = processor(
                     text=[text],
                     images=image_inputs,
@@ -409,7 +514,7 @@ def autocaption_videos(videos_path: str, video_files: set, caption_files: set) -
                     top_p=0.9,
                 )
                 generated_ids_trimmed = [
-                    out_ids[len(in_ids):] 
+                    out_ids[len(in_ids) :]
                     for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
                 ]
                 caption = processor.batch_decode(
@@ -417,32 +522,54 @@ def autocaption_videos(videos_path: str, video_files: set, caption_files: set) -
                     skip_special_tokens=True,
                     clean_up_tokenization_spaces=False,
                 )[0]
-                
-                print(f"\nGenerated caption: '{caption}'")
-                
+
+                # Combine prefix, trigger, caption, and suffix
+                final_caption = f"{prefix}{trigger}{caption.strip()}{suffix}"
+                print("\n📝 Generated Caption:")
+                print("--------------------")
+                print(f"{final_caption}")
+                print("--------------------")
+
             except Exception as e:
-                print(f"Warning: Failed to autocaption {vid_name}.mp4: {str(e)}")
-                caption = f"A video clip named {vid_name}"
-                print(f"Using fallback caption: '{caption}'")
-            
+                print(f"\n⚠️  Warning: Failed to autocaption {vid_name}.mp4")
+                print(f"Error: {str(e)}")
+                final_caption = (
+                    f"{prefix}{trigger}A video clip named {vid_name}{suffix}"
+                )
+                print("\n📝 Using fallback caption:")
+                print("--------------------")
+                print(f"{final_caption}")
+                print("--------------------")
+
             # Save caption
             txt_path = os.path.join(videos_path, vid_name + ".txt")
             with open(txt_path, "w") as f:
-                f.write(caption.strip() + "\n")
+                f.write(final_caption.strip() + "\n")
             new_caption_files.add(vid_name)
-            print(f"Saved caption to: {txt_path}")
+            print(f"✅ Saved to: {txt_path}")
 
     # Clean up QWEN model
-    print("\nCleaning up QWEN model...")
+    print("\n=== 🧹 Cleaning Up ===")
     del model
     del processor
     import torch
+
     torch.cuda.empty_cache()
-    
+
+    print(f"✨ Successfully processed {len(videos_without_captions)} videos!")
+    print("=====================================")
+
     return new_caption_files
 
 
-def extract_zip(zip_path: Path, extraction_dir: str, autocaption: bool = True):
+def extract_zip(
+    zip_path: Path,
+    extraction_dir: str,
+    autocaption: bool = True,
+    trigger_word: Optional[str] = None,
+    autocaption_prefix: Optional[str] = None,
+    autocaption_suffix: Optional[str] = None,
+):
     """
     Extract videos & .txt captions from the provided zip.
     If autocaption is True, generate captions for missing videos.
@@ -494,7 +621,12 @@ def extract_zip(zip_path: Path, extraction_dir: str, autocaption: bool = True):
     # Handle autocaptioning if needed
     if autocaption:
         caption_files = autocaption_videos(
-            final_videos_path, video_files, caption_files
+            final_videos_path,
+            video_files,
+            caption_files,
+            trigger_word,
+            autocaption_prefix,
+            autocaption_suffix,
         )
 
     # Final validation
@@ -513,14 +645,14 @@ def extract_zip(zip_path: Path, extraction_dir: str, autocaption: bool = True):
         )
 
     # Report results
-    print(f"Extracted {file_count} total files (flattened) to: {final_videos_path}")
-    print(f"Found {len(video_files & caption_files)} valid video-caption pairs")
+    print(f"✅ Extracted {file_count} files to: {final_videos_path}")
+    print(f"📊 Status:")
+    print(f"  • Valid Pairs: {len(video_files & caption_files)} video-caption pairs")
     if videos_without_captions:
-        print(f"Warning: Videos still missing captions: {videos_without_captions}")
+        print(f"  • ⚠️  Missing Captions: {len(videos_without_captions)} videos")
     if captions_without_videos:
-        print(
-            f"Warning: Found captions without matching videos: {captions_without_videos}"
-        )
+        print(f"  • ⚠️  Orphaned Captions: {len(captions_without_videos)} files")
+    print("=====================================")
 
 
 def handle_hf_upload(hf_repo_id: str, hf_token: Secret):
@@ -583,6 +715,7 @@ def handle_hf_readme(hf_repo_id: str) -> str:
 
 def setup_qwen_model():
     """Download and setup Qwen2-VL model for auto-captioning"""
+    # TODO: use download_weights() instead
     if not os.path.exists(QWEN_MODEL_CACHE):
         print(f"Downloading Qwen2-VL model to {QWEN_MODEL_CACHE}")
         start = time.time()
