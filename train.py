@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from zipfile import ZipFile, is_zipfile
 from huggingface_hub import HfApi
 from cog import BaseModel, Input, Path, Secret
@@ -11,6 +12,12 @@ from cog import BaseModel, Input, Path, Secret
 class TrainingOutput(BaseModel):
     weights: Path
 
+
+# [ADDED] Constants for Qwen2-VL model
+QWEN_MODEL_CACHE = "qwen_checkpoints"
+QWEN_MODEL_URL = (
+    "https://weights.replicate.delivery/default/qwen/Qwen2-VL-7B-Instruct/model.tar"
+)
 
 INPUT_DIR = "input"
 OUTPUT_DIR = "output"
@@ -25,11 +32,11 @@ sys.path.append("musubi-tuner")
 
 def train(
     input_videos: Path = Input(
-        description="A zip file containing videos and matching .txt captions.",
+        description="A zip file containing videos and (optionally) .txt captions. If no captions (or partial), auto-caption if autocaption=True.",
         default=None,
     ),
     epochs: int = Input(
-        description="Number of training epochs (each approximately one pass over dataset).",
+        description="Number of training epochs (each ~1 pass).",
         default=16,
         ge=1,
         le=2000,
@@ -97,6 +104,10 @@ def train(
         description="Random seed (use <=0 for a random pick).",
         default=0,
     ),
+    autocaption: bool = Input(
+        description="If True, generate captions for any video missing a .txt file.",
+        default=True,
+    ),
     hf_repo_id: str = Input(
         description="Hugging Face repository ID, if you'd like to upload the trained LoRA to Hugging Face. For example, lucataco/flux-dev-lora. If the given repo does not exist, a new public repo will be created.",
         default=None,
@@ -107,11 +118,13 @@ def train(
     ),
 ) -> TrainingOutput:
     """
-    Minimal Hunyuan LoRA training script using musubi-tuner.
+    Minimal Hunyuan LoRA training script using musubi-tuner, with optional auto-captioning.
     """
 
     if not input_videos:
-        raise ValueError("You must provide a zip with videos & .txt captions.")
+        raise ValueError(
+            "You must provide a zip with videos & optionally .txt captions."
+        )
 
     clean_up()
     download_weights()
@@ -119,7 +132,7 @@ def train(
     create_train_toml(
         consecutive_target_frames, frame_extraction_method, frame_stride, frame_sample
     )
-    extract_zip(input_videos, INPUT_DIR)
+    extract_zip(input_videos, INPUT_DIR, autocaption=autocaption)
     cache_latents()
     cache_text_encoder_outputs(batch_size)
     run_lora_training(
@@ -335,41 +348,133 @@ def download_weights():
             subprocess.check_call(["pget", "-xf", url, MODEL_CACHE])
 
 
-def extract_zip(zip_path: Path, extraction_dir: str):
-    """Extract videos & .txt captions from the provided zip
-    and flatten any nested folder structure so that all
-    .mp4 and .txt files end up under extraction_dir/videos.
+def autocaption_videos(videos_path: str, video_files: set, caption_files: set) -> set:
+    """Generate captions for videos that don't have matching .txt files."""
+    videos_without_captions = video_files - caption_files
+    if not videos_without_captions:
+        return caption_files
+
+    print("Auto-captioning videos missing .txt files...")
+    model, processor = setup_qwen_model()
+    
+    new_caption_files = caption_files.copy()
+    for vid_name in videos_without_captions:
+        mp4_path = os.path.join(videos_path, vid_name + ".mp4")
+        if os.path.exists(mp4_path):
+            print(f"\nProcessing video: {mp4_path}")
+            
+            # Use absolute path without file:// prefix
+            abs_path = os.path.abspath(mp4_path)
+            
+            # Prepare messages format
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "video",
+                            "video": abs_path,  # Remove file:// prefix
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe this video clip in detail, focusing on the key visual elements, actions, and overall scene.",
+                        },
+                    ],
+                }
+            ]
+            
+            # Process inputs
+            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            print("\nPrompt template:", text)
+            
+            try:
+                # Import qwen utils here to avoid circular imports
+                from qwen_vl_utils import process_vision_info
+                image_inputs, video_inputs = process_vision_info(messages)
+                
+                inputs = processor(
+                    text=[text],
+                    images=image_inputs,
+                    videos=video_inputs,
+                    padding=True,
+                    return_tensors="pt",
+                ).to("cuda")
+
+                print("\nGenerating caption...")
+                generated_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=128,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.9,
+                )
+                generated_ids_trimmed = [
+                    out_ids[len(in_ids):] 
+                    for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+                ]
+                caption = processor.batch_decode(
+                    generated_ids_trimmed,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )[0]
+                
+                print(f"\nGenerated caption: '{caption}'")
+                
+            except Exception as e:
+                print(f"Warning: Failed to autocaption {vid_name}.mp4: {str(e)}")
+                caption = f"A video clip named {vid_name}"
+                print(f"Using fallback caption: '{caption}'")
+            
+            # Save caption
+            txt_path = os.path.join(videos_path, vid_name + ".txt")
+            with open(txt_path, "w") as f:
+                f.write(caption.strip() + "\n")
+            new_caption_files.add(vid_name)
+            print(f"Saved caption to: {txt_path}")
+
+    # Clean up QWEN model
+    print("\nCleaning up QWEN model...")
+    del model
+    del processor
+    import torch
+    torch.cuda.empty_cache()
+    
+    return new_caption_files
+
+
+def extract_zip(zip_path: Path, extraction_dir: str, autocaption: bool = True):
+    """
+    Extract videos & .txt captions from the provided zip.
+    If autocaption is True, generate captions for missing videos.
     """
     if not is_zipfile(zip_path):
         raise ValueError("The provided input_videos must be a zip file.")
 
+    # Setup directories
     os.makedirs(extraction_dir, exist_ok=True)
     final_videos_path = os.path.join(extraction_dir, "videos")
     os.makedirs(final_videos_path, exist_ok=True)
 
-    # Track what we find for validation
+    # Extract and track files
     video_files = set()
     caption_files = set()
-
     file_count = 0
+
     with ZipFile(zip_path, "r") as zip_ref:
         for file_info in zip_ref.infolist():
-            # Skip hidden Mac system files/folders
             if not file_info.filename.startswith(
                 "__MACOSX/"
             ) and not file_info.filename.startswith("._"):
-                # Get just the filename without path
                 base_name = os.path.basename(file_info.filename)
-                if base_name:  # Skip if it's a directory
+                if base_name:
                     if base_name.endswith(".mp4"):
                         video_files.add(os.path.splitext(base_name)[0])
                     elif base_name.endswith(".txt"):
                         caption_files.add(os.path.splitext(base_name)[0])
-
                 zip_ref.extract(file_info, final_videos_path)
                 file_count += 1
 
-    # Flatten all subdirectories into final_videos_path
+    # Flatten directory structure
     for root, dirs, files in os.walk(final_videos_path):
         if root == final_videos_path:
             continue
@@ -386,29 +491,36 @@ def extract_zip(zip_path: Path, extraction_dir: str):
             except OSError:
                 pass
 
-    # Validate we have matching pairs
+    # Handle autocaptioning if needed
+    if autocaption:
+        caption_files = autocaption_videos(
+            final_videos_path, video_files, caption_files
+        )
+
+    # Final validation
     videos_without_captions = video_files - caption_files
     captions_without_videos = caption_files - video_files
-    if videos_without_captions:
-        print(
-            f"Warning: Found videos without matching captions: {videos_without_captions}"
-        )
-    if captions_without_videos:
-        print(
-            f"Warning: Found captions without matching videos: {captions_without_videos}"
-        )
 
     if not video_files:
         raise ValueError("No video files found in zip!")
     if not caption_files:
-        raise ValueError("No caption files found in zip!")
+        raise ValueError(
+            "No caption files found in zip (and autocaption didn't generate any)!"
+        )
     if not (video_files & caption_files):
         raise ValueError(
-            "No matching video-caption pairs found! Make sure filenames match (e.g., video.mp4 and video.txt)"
+            "No matching video-caption pairs found after checking or generating captions!"
         )
 
+    # Report results
     print(f"Extracted {file_count} total files (flattened) to: {final_videos_path}")
     print(f"Found {len(video_files & caption_files)} valid video-caption pairs")
+    if videos_without_captions:
+        print(f"Warning: Videos still missing captions: {videos_without_captions}")
+    if captions_without_videos:
+        print(
+            f"Warning: Found captions without matching videos: {captions_without_videos}"
+        )
 
 
 def handle_hf_upload(hf_repo_id: str, hf_token: Secret):
@@ -467,3 +579,27 @@ def handle_hf_readme(hf_repo_id: str) -> str:
     print("\n==================\n")
     readme_path.write_text(content)
     return title.replace(" ", "-")
+
+
+def setup_qwen_model():
+    """Download and setup Qwen2-VL model for auto-captioning"""
+    if not os.path.exists(QWEN_MODEL_CACHE):
+        print(f"Downloading Qwen2-VL model to {QWEN_MODEL_CACHE}")
+        start = time.time()
+        subprocess.check_call(["pget", "-xf", QWEN_MODEL_URL, QWEN_MODEL_CACHE])
+        print(f"Download took: {time.time() - start:.2f}s")
+
+    import torch
+    from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+    from qwen_vl_utils import process_vision_info
+
+    print("\nLoading QWEN model...")
+    model = Qwen2VLForConditionalGeneration.from_pretrained(
+        QWEN_MODEL_CACHE,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+        device_map="auto",
+    )
+    processor = AutoProcessor.from_pretrained(QWEN_MODEL_CACHE)
+
+    return model, processor
