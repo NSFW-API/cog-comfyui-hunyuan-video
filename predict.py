@@ -217,6 +217,39 @@ class Predictor(BasePredictor):
         workflow["42"]["inputs"]["start_percent"] = enhance_start
         workflow["42"]["inputs"]["end_percent"] = enhance_end
 
+    def validate_dimension(self, n: int, multiple: int = 16) -> int:
+        """
+        Adjusts dimension to nearest multiple of 16 (required by model).
+        """
+        return ((n + multiple - 1) // multiple) * multiple
+
+    def validate_enhance_params(self, start: float, end: float) -> tuple[float, float]:
+        """
+        Validates and adjusts enhancement start/end percentages.
+        - Must be between 0.0 and 1.0
+        - Start must be less than end
+        """
+        start = max(0.0, min(1.0, start))
+        end = max(0.0, min(1.0, end))
+
+        if start >= end:
+            print(
+                f"⚠️  Adjusted enhance_end from {end} to {start + 0.1} to ensure it's greater than enhance_start"
+            )
+            end = min(1.0, start + 0.1)
+
+        return start, end
+
+    def validate_frame_count(self, n: int) -> int:
+        """
+        Adjusts frame count to nearest valid value where (n-1) is divisible by 4.
+        Valid values follow pattern: 4n + 1 where n ≥ 0 (e.g., 1, 5, 9, 13, 17, 21, 25, 29, 33, ...)
+        """
+        if n <= 1:
+            return 1
+        # Subtract 1, round to nearest multiple of 4, add 1 back
+        return (((n - 1) + 2) // 4 * 4) + 1
+
     def predict(
         self,
         # -------------------------------------------
@@ -362,6 +395,35 @@ class Predictor(BasePredictor):
         """
         # Convert user seed to a valid integer
         seed = seed_helper.generate(seed)
+
+        # Validate and adjust dimensions
+        original_width, original_height = width, height
+        width = self.validate_dimension(width)
+        height = self.validate_dimension(height)
+        if width != original_width or height != original_height:
+            print(
+                f"⚠️  Adjusted dimensions from {original_width}x{original_height} to {width}x{height} to satisfy model requirements"
+            )
+
+        # Validate and adjust frame count
+        original_frames = num_frames
+        num_frames = self.validate_frame_count(num_frames)
+        if num_frames != original_frames:
+            print(
+                f"⚠️  Adjusted frame count from {original_frames} to {num_frames} to satisfy model requirements"
+            )
+
+        # Validate enhance parameters
+        enhance_start, enhance_end = self.validate_enhance_params(
+            enhance_start, enhance_end
+        )
+
+        # Double check that our frame count is valid
+        if (num_frames - 1) % 4 != 0:
+            raise ValueError(
+                f"Internal error: frame count {num_frames} is invalid after adjustment. "
+                f"Please report this bug."
+            )
 
         # 1. Clean up previous runs
         self.comfyUI.cleanup(ALL_DIRECTORIES)
