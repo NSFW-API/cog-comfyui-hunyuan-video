@@ -87,10 +87,16 @@ def train(
         default=None,
     ),
     epochs: int = Input(
-        description="Number of training epochs. Each epoch is approximately one pass through your videos.",
+        description="Number of training epochs. Each epoch processes all your videos once. Note: If max_train_steps is set, training may end before completing all epochs.",
         default=16,
         ge=1,
         le=2000,
+    ),
+    max_train_steps: int = Input(
+        description="Maximum number of training steps to perform. Each step processes one batch of frames. Set to -1 to train for the full number of epochs. If positive, training will stop after this many steps even if all epochs aren't complete.",
+        default=-1,
+        ge=-1,
+        le=1_000_000,
     ),
     rank: int = Input(
         description="LoRA rank for training. Higher ranks take longer to train but can capture more complex features. Caption quality is more important for higher ranks.",
@@ -166,6 +172,8 @@ def train(
     print(f"  • Input: {input_videos}")
     print(f"  • Training:")
     print(f"    - Epochs: {epochs}")
+    if max_train_steps > 0:
+        print(f"    - Max Steps: {max_train_steps}")
     print(f"    - LoRA Rank: {rank}")
     print(f"    - Learning Rate: {learning_rate}")
     print(f"    - Batch Size: {batch_size}")
@@ -201,12 +209,13 @@ def train(
     cache_latents()
     cache_text_encoder_outputs(batch_size)
     run_lora_training(
-        epochs,
-        rank,
-        optimizer,
-        learning_rate,
-        timestep_sampling,
-        seed,
+        epochs=epochs,
+        rank=rank,
+        optimizer=optimizer,
+        learning_rate=learning_rate,
+        timestep_sampling=timestep_sampling,
+        seed=seed,
+        max_train_steps=max_train_steps,
     )
     convert_lora_to_comfyui_format()
     output_path = archive_results()
@@ -317,10 +326,18 @@ def run_lora_training(
     learning_rate: float,
     timestep_sampling: str,
     seed: int,
+    max_train_steps: int = -1,  # Keep same interface as train()
 ):
-    """Run LoRA training"""
+    """Run LoRA training with optional step limit"""
     print("\n=== 🚀 Starting LoRA Training ===")
-    print(f"• Epochs: {epochs}")
+
+    # Convert negative to zero for hv_train_network.py
+    actual_max_steps = max(0, max_train_steps)
+
+    if actual_max_steps > 0:
+        print(f"• Max Train Steps: {actual_max_steps}")
+    else:
+        print(f"• Epochs: {epochs}")
     print("=====================================")
 
     training_args = [
@@ -357,8 +374,6 @@ def run_lora_training(
         timestep_sampling,
         "--discrete_flow_shift",
         "1.0",
-        "--max_train_epochs",
-        str(epochs),
         "--seed",
         str(seed),
         "--output_dir",
@@ -367,6 +382,12 @@ def run_lora_training(
         "lora",
         "--gradient_checkpointing",
     ]
+
+    # Only add one of max_train_epochs or max_train_steps
+    if actual_max_steps > 0:
+        training_args.extend(["--max_train_steps", str(actual_max_steps)])
+    else:
+        training_args.extend(["--max_train_epochs", str(epochs)])
 
     subprocess.run(training_args, check=True)
     print("\n✨ Training Complete!")
