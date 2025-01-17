@@ -55,6 +55,7 @@ ComfyUI/comfyui_screenshot.png
 /ckpts/*
 /overfit_to_one_video
 /qwen_checkpoints
+qwen_checkpoints
 /luis-dataset
 /*.zip
 /input
