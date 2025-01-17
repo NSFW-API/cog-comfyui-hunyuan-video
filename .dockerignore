@@ -54,5 +54,10 @@ ComfyUI/comfyui_screenshot.png
 # Musubi-tuner
 /ckpts/*
 /overfit_to_one_video
+/qwen_checkpoints
+qwen_checkpoints
 /luis-dataset
 /*.zip
+/input
+/output
+/hunyuan-lora-for-hf

@@ -21,3 +21,4 @@ downloaded_user_models/
 /input/
 /train.toml
 /weights
+/qwen_checkpoints
