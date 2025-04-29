@@ -6,7 +6,11 @@
       "quantization": "fp8_e4m3fn",
       "load_device": "offload_device",
       "attention_mode": "sdpa",
-      "auto_cpu_offload": false
+      "auto_cpu_offload": false,
+      "lora": [
+        "41",
+        0
+      ]
     },
     "class_type": "HyVideoModelLoader",
     "_meta": {
@@ -26,7 +30,7 @@
       "denoise_strength": 1,
       "scheduler": "DPMSolverMultistepScheduler",
       "model": [
-        "45",
+        "1",
         0
       ],
       "hyvid_embeds": [
@@ -124,6 +128,16 @@
       "title": "Video Combine 🎥🅥🅗🅢"
     }
   },
+  "41": {
+    "inputs": {
+      "lora": "hunyuan-cyberpunk-mod.safetensors",
+      "strength": 1
+    },
+    "class_type": "HyVideoLoraSelect",
+    "_meta": {
+      "title": "HunyuanVideo Lora Select"
+    }
+  },
   "42": {
     "inputs": {
       "weight": 0.5,
@@ -135,36 +149,6 @@
     "class_type": "HyVideoEnhanceAVideo",
     "_meta": {
       "title": "HunyuanVideo Enhance A Video"
-    }
-  },
-  "44": {
-    "inputs": {
-      "model": [
-        "1",
-        0
-      ],
-      "lora_name": "",
-      "strength": 1.0,
-      "blocks_type": "all"
-    },
-    "class_type": "HunyuanVideoLoraLoader",
-    "_meta": {
-      "title": "First LoRA"
-    }
-  },
-  "45": {
-    "inputs": {
-      "model": [
-        "44",
-        0
-      ],
-      "lora_name": "",
-      "strength": 1.0,
-      "blocks_type": "all"
-    },
-    "class_type": "HunyuanVideoLoraLoader",
-    "_meta": {
-      "title": "Second LoRA"
     }
   }
 }
