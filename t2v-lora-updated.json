@@ -8,7 +8,7 @@
       "attention_mode": "sdpa",
       "auto_cpu_offload": false,
       "lora": [
-        "41",
+        "71",
         0
       ]
     },
@@ -130,12 +130,12 @@
   },
   "41": {
     "inputs": {
-      "lora": "hunyuan-cyberpunk-mod.safetensors",
-      "strength": 1
+      "lora": "primary-lora.safetensors",
+      "strength": 1.0
     },
     "class_type": "HyVideoLoraSelect",
     "_meta": {
-      "title": "HunyuanVideo Lora Select"
+      "title": "HunyuanVideo Lora Select (Primary)"
     }
   },
   "42": {
@@ -149,6 +149,20 @@
     "class_type": "HyVideoEnhanceAVideo",
     "_meta": {
       "title": "HunyuanVideo Enhance A Video"
+    }
+  },
+  "71": {
+    "inputs": {
+      "lora": "secondary-lora.safetensors",
+      "strength": 0.5,
+      "model": [
+        "41",
+        0
+      ]
+    },
+    "class_type": "HyVideoLoraSelect",
+    "_meta": {
+      "title": "HunyuanVideo Lora Select (Secondary)"
     }
   }
 }

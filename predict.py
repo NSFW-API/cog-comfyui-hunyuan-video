@@ -6,7 +6,7 @@ import re
 import requests
 import tarfile
 import tempfile
-from typing import Any
+from typing import Any, List, Optional
 
 from cog import BasePredictor, Input, Path
 from comfyui import ComfyUI
@@ -33,7 +33,7 @@ if "HF_HUB_OFFLINE" in os.environ:
 class Predictor(BasePredictor):
     def setup(self):
         """
-        Start ComfyUI, ensuring it doesn't attempt to download our local LoRA file
+        Start ComfyUI, ensuring it doesn't attempt to download our local LoRA files
         before running. We do this by blanking out node 41's "lora" field so the
         weight downloader never sees it.
         """
@@ -169,19 +169,24 @@ class Predictor(BasePredictor):
         force_offload: bool,
         denoise_strength: float,
         num_frames: int,
-        lora_name: str,
-        lora_strength: float,
-        frame_rate: int,
-        crf: int,
-        enhance_weight: float,
-        enhance_single: bool,
-        enhance_double: bool,
-        enhance_start: float,
-        enhance_end: float,
-        scheduler: str,
+        lora1_name: str,
+        lora1_strength: float,
+        lora2_name: Optional[str] = None,
+        lora2_strength: float = 0.0,
+        frame_rate: int = 16,
+        crf: int = 19,
+        enhance_weight: float = 0.3,
+        enhance_single: bool = True,
+        enhance_double: bool = True,
+        enhance_start: float = 0.0,
+        enhance_end: float = 1.0,
+        scheduler: str = "DPMSolverMultistepScheduler",
     ):
         """
         Update the t2v-lora-updated.json workflow with user-selected parameters.
+        Support for dual LoRAs by either:
+        1. Using node 41 for the first LoRA and adding node 71 for the second LoRA, or
+        2. Using the special ComfyUI-HunyuanVideoMultiLora plugin if available
         """
         # Node 3: HyVideoSampler
         workflow["3"]["inputs"]["width"] = width
@@ -201,9 +206,50 @@ class Predictor(BasePredictor):
             "bad quality video" if force_offload else " "
         )
 
-        # Node 41: HyVideoLoraSelect
-        workflow["41"]["inputs"]["lora"] = lora_name
-        workflow["41"]["inputs"]["strength"] = lora_strength
+        # Node 41: HyVideoLoraSelect - First LoRA
+        workflow["41"]["inputs"]["lora"] = lora1_name
+        workflow["41"]["inputs"]["strength"] = lora1_strength
+
+        # Second LoRA handling
+        if lora2_name and lora2_strength > 0:
+            # Check if node 71 exists already
+            if "71" not in workflow:
+                # Create a new node 71 which is a clone of node 41 but connected to node 41's output
+                workflow["71"] = {
+                    "inputs": {
+                        "lora": lora2_name,
+                        "strength": lora2_strength
+                    },
+                    "class_type": "HyVideoLoraSelect",
+                    "_meta": {
+                        "title": "HunyuanVideo Lora Select 2"
+                    }
+                }
+
+                # Update node connections - connect node 71 to node 41 output
+                # The 1 node should now connect to node 71 instead of 41
+                # First, find which input of node 1 is connected to node 41's output
+                for key, value in workflow["1"]["inputs"].items():
+                    if isinstance(value, list) and value[0] == "41":
+                        # Update connection to get input from node 71 instead
+                        workflow["1"]["inputs"][key] = ["71", 0]
+                        # Add connection from node 41 to node 71
+                        workflow["71"]["inputs"]["model"] = ["41", 0]
+                        break
+            else:
+                # Node 71 already exists, update its parameters
+                workflow["71"]["inputs"]["lora"] = lora2_name
+                workflow["71"]["inputs"]["strength"] = lora2_strength
+        elif "71" in workflow:
+            # If the second LoRA is not being used but node 71 exists,
+            # we need to reconnect node 1 directly to node 41
+            for key, value in workflow["1"]["inputs"].items():
+                if isinstance(value, list) and value[0] == "71":
+                    # Reconnect directly to node 41
+                    workflow["1"]["inputs"][key] = ["41", 0]
+
+            # Remove node 71 from workflow
+            workflow.pop("71", None)
 
         # Node 34: VHS_VideoCombine
         workflow["34"]["inputs"]["frame_rate"] = frame_rate
@@ -253,21 +299,31 @@ class Predictor(BasePredictor):
     def predict(
         self,
         # -------------------------------------------
-        # 1. PROMPT & LoRA
+        # 1. PROMPT & LoRAs
         # -------------------------------------------
         prompt: str = Input(
             default="",
             description="The text prompt describing your video scene.",
         ),
-        lora_url: str = Input(
+        lora1_url: str = Input(
             default="",
-            description="A URL pointing to your LoRA .safetensors file or a Hugging Face repo (e.g. 'user/repo' - uses the first .safetensors file).",
+            description="Primary LoRA: URL or Hugging Face repo (e.g. 'user/repo') for your first LoRA .safetensors file.",
         ),
-        lora_strength: float = Input(
+        lora1_strength: float = Input(
             default=1.0,
             ge=-10.0,
             le=10.0,
-            description="Scale/strength for your LoRA.",
+            description="Scale/strength for your primary LoRA.",
+        ),
+        lora2_url: str = Input(
+            default="",
+            description="Secondary LoRA: URL or Hugging Face repo (optional) for your second LoRA .safetensors file.",
+        ),
+        lora2_strength: float = Input(
+            default=0.5,
+            ge=-10.0,
+            le=10.0,
+            description="Scale/strength for your secondary LoRA (if provided).",
         ),
         # -------------------------------------------
         # 2. SAMPLING CONTROLS
@@ -391,7 +447,9 @@ class Predictor(BasePredictor):
         """
         Create a video using HunyuanVideo with either:
           • replicate_weights tar (preferred if provided)
-          • a direct lora_url (HTTP link or Hugging Face repo ID)
+          • one or two direct lora_urls (HTTP links or Hugging Face repo IDs)
+
+        You can now blend two LoRAs for more creative control.
         """
         # Convert user seed to a valid integer
         seed = seed_helper.generate(seed)
@@ -428,17 +486,24 @@ class Predictor(BasePredictor):
         # 1. Clean up previous runs
         self.comfyUI.cleanup(ALL_DIRECTORIES)
 
-        # 2. Decide how to obtain our LoRA file name
+        # 2. Obtain LoRA file names
+        lora1_name = None
+        lora2_name = None
+
         if replicate_weights is not None:
             # Use replicate tar (prefer the comfyui version)
-            lora_name = self.handle_replicate_weights(replicate_weights)
+            lora1_name = self.handle_replicate_weights(replicate_weights)
         else:
-            # Use the remote url or huggingface repo
-            if not lora_url:
+            # Use the remote urls or huggingface repos
+            if not lora1_url:
                 raise ValueError(
-                    "No LoRA provided. Provide either replicate_weights tar or a lora_url."
+                    "No primary LoRA provided. Provide either replicate_weights tar or a lora1_url."
                 )
-            lora_name = self.copy_lora_file(lora_url)
+            lora1_name = self.copy_lora_file(lora1_url)
+
+            # Handle second LoRA if provided
+            if lora2_url and lora2_strength != 0.0:
+                lora2_name = self.copy_lora_file(lora2_url)
 
         # 3. Load the updated workflow JSON
         with open(api_json_file, "r") as f:
@@ -446,8 +511,11 @@ class Predictor(BasePredictor):
 
         # 3a. Zero out node 41 lora so handle_weights won't see it
         workflow["41"]["inputs"]["lora"] = ""
+        # Also clear node 71 if it exists
+        if "71" in workflow:
+            workflow["71"]["inputs"]["lora"] = ""
 
-        # 4. Fill in user parameters, skipping the real LoRA name/strength for now
+        # 4. Fill in user parameters, skipping the real LoRA names/strengths for now
         self.update_workflow(
             workflow=workflow,
             prompt=prompt,
@@ -460,8 +528,10 @@ class Predictor(BasePredictor):
             force_offload=force_offload,
             denoise_strength=denoise_strength,
             num_frames=num_frames,
-            lora_name="",  # intentionally blank
-            lora_strength=0.0,  # skip real strength
+            lora1_name="",  # intentionally blank
+            lora1_strength=0.0,  # skip real strength
+            lora2_name="",  # intentionally blank
+            lora2_strength=0.0,  # skip real strength
             frame_rate=frame_rate,
             crf=crf,
             enhance_weight=enhance_weight,
@@ -475,9 +545,14 @@ class Predictor(BasePredictor):
         # 5. Load the workflow -> handle_weights sees lora="", won't attempt a download
         wf = self.comfyUI.load_workflow(workflow)
 
-        # 5a. Now set the real LoRA file
-        wf["41"]["inputs"]["lora"] = lora_name
-        wf["41"]["inputs"]["strength"] = lora_strength
+        # 5a. Now set the real LoRA files
+        wf["41"]["inputs"]["lora"] = lora1_name
+        wf["41"]["inputs"]["strength"] = lora1_strength
+
+        # Set the second LoRA if provided
+        if lora2_name and lora2_strength != 0.0 and "71" in wf:
+            wf["71"]["inputs"]["lora"] = lora2_name
+            wf["71"]["inputs"]["strength"] = lora2_strength
 
         # 6. Run the workflow
         self.comfyUI.connect()
