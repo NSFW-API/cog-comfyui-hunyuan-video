@@ -5,9 +5,11 @@ build:
     - ffmpeg
   python_version: "3.10.6"
   python_packages:
-    - torch
-    - torchvision
-    - torchaudio
+    - "torch==2.2.0"
+    - "torchvision==0.17.0"
+    - "torchaudio==2.2.0"
+    - bitsandbytes
+    - "triton==2.2.0"
     - torchsde
     # - einops
     # - transformers>=4.39.3

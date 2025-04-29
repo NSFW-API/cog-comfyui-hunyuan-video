@@ -1,17 +1,18 @@
-import os
 import json
 import mimetypes
-import shutil
+import os
 import re
-import requests
+import shutil
 import tarfile
 import tempfile
 from typing import Any
 
+import requests
 from cog import BasePredictor, Input, Path
-from comfyui import ComfyUI
-from cog_model_helpers import seed as seed_helper
 from huggingface_hub import HfApi
+
+from cog_model_helpers import seed as seed_helper
+from comfyui import ComfyUI
 
 # Directories for inputs/outputs
 OUTPUT_DIR = "/tmp/outputs"
@@ -33,9 +34,8 @@ if "HF_HUB_OFFLINE" in os.environ:
 class Predictor(BasePredictor):
     def setup(self):
         """
-        Start ComfyUI, ensuring it doesn't attempt to download our local LoRA file
-        before running. We do this by blanking out node 41's "lora" field so the
-        weight downloader never sees it.
+        Start ComfyUI, ensuring we blank out LoRA fields in the LoraLoader nodes
+        so the weight downloader doesn't try to fetch them during setup.
         """
         self.comfyUI = ComfyUI("127.0.0.1:8188")
         self.comfyUI.start_server(OUTPUT_DIR, INPUT_DIR)
@@ -44,9 +44,12 @@ class Predictor(BasePredictor):
         with open(api_json_file, "r") as file:
             workflow = json.loads(file.read())
 
-        # 2. Blank node 41's "lora" so ComfyUI won't attempt to download it
-        if workflow.get("41") and "lora" in workflow["41"]["inputs"]:
-            workflow["41"]["inputs"]["lora"] = ""
+        # 2. Blank out LoRA names in the loader nodes
+        if workflow.get("44") and "lora_name" in workflow["44"]["inputs"]:
+            workflow["44"]["inputs"]["lora_name"] = ""
+
+        if workflow.get("45") and "lora_name" in workflow["45"]["inputs"]:
+            workflow["45"]["inputs"]["lora_name"] = ""
 
         # 3. Only handle the base model weights here
         self.comfyUI.handle_weights(
@@ -157,28 +160,30 @@ class Predictor(BasePredictor):
         return filename
 
     def update_workflow(
-        self,
-        workflow: dict[str, Any],
-        prompt: str,
-        width: int,
-        height: int,
-        steps: int,
-        guidance_scale: float,
-        flow_shift: int,
-        seed: int,
-        force_offload: bool,
-        denoise_strength: float,
-        num_frames: int,
-        lora_name: str,
-        lora_strength: float,
-        frame_rate: int,
-        crf: int,
-        enhance_weight: float,
-        enhance_single: bool,
-        enhance_double: bool,
-        enhance_start: float,
-        enhance_end: float,
-        scheduler: str,
+            self,
+            workflow: dict[str, Any],
+            prompt: str,
+            width: int,
+            height: int,
+            steps: int,
+            guidance_scale: float,
+            flow_shift: int,
+            seed: int,
+            force_offload: bool,
+            denoise_strength: float,
+            num_frames: int,
+            lora_name: str,
+            lora_strength: float,
+            lora2_name: str,
+            lora2_strength: float,
+            frame_rate: int,
+            crf: int,
+            enhance_weight: float,
+            enhance_single: bool,
+            enhance_double: bool,
+            enhance_start: float,
+            enhance_end: float,
+            scheduler: str,
     ):
         """
         Update the t2v-lora-updated.json workflow with user-selected parameters.
@@ -201,9 +206,13 @@ class Predictor(BasePredictor):
             "bad quality video" if force_offload else " "
         )
 
-        # Node 41: HyVideoLoraSelect
-        workflow["41"]["inputs"]["lora"] = lora_name
-        workflow["41"]["inputs"]["strength"] = lora_strength
+        # Node 44: First LoRA
+        workflow["44"]["inputs"]["lora_name"] = lora_name
+        workflow["44"]["inputs"]["strength"] = lora_strength
+
+        # Node 45: Second LoRA
+        workflow["45"]["inputs"]["lora_name"] = lora2_name
+        workflow["45"]["inputs"]["strength"] = lora2_strength
 
         # Node 34: VHS_VideoCombine
         workflow["34"]["inputs"]["frame_rate"] = frame_rate
@@ -251,142 +260,152 @@ class Predictor(BasePredictor):
         return (((n - 1) + 2) // 4 * 4) + 1
 
     def predict(
-        self,
-        # -------------------------------------------
-        # 1. PROMPT & LoRA
-        # -------------------------------------------
-        prompt: str = Input(
-            default="",
-            description="The text prompt describing your video scene.",
-        ),
-        lora_url: str = Input(
-            default="",
-            description="A URL pointing to your LoRA .safetensors file or a Hugging Face repo (e.g. 'user/repo' - uses the first .safetensors file).",
-        ),
-        lora_strength: float = Input(
-            default=1.0,
-            ge=-10.0,
-            le=10.0,
-            description="Scale/strength for your LoRA.",
-        ),
-        # -------------------------------------------
-        # 2. SAMPLING CONTROLS
-        # -------------------------------------------
-        scheduler: str = Input(
-            default="DPMSolverMultistepScheduler",
-            choices=[
-                "FlowMatchDiscreteScheduler",
-                "SDE-DPMSolverMultistepScheduler",
-                "DPMSolverMultistepScheduler",
-                "SASolverScheduler",
-                "UniPCMultistepScheduler",
-            ],
-            description="Algorithm used to generate the video frames.",
-        ),
-        steps: int = Input(
-            default=50,
-            ge=1,
-            le=150,
-            description="Number of diffusion steps.",
-        ),
-        guidance_scale: float = Input(
-            default=6.0,
-            ge=0.0,
-            le=30.0,
-            description="Overall influence of text vs. model.",
-        ),
-        flow_shift: int = Input(
-            default=9,
-            ge=0,
-            le=20,
-            description="Video continuity factor (flow).",
-        ),
-        # -------------------------------------------
-        # 3. VIDEO DIMENSIONS & FRAMES
-        # -------------------------------------------
-        num_frames: int = Input(
-            default=33,
-            ge=1,
-            le=1440,
-            description="How many frames (duration) in the resulting video.",
-        ),
-        width: int = Input(
-            default=640,
-            ge=64,
-            le=1536,
-            description="Width for the generated video.",
-        ),
-        height: int = Input(
-            default=360,
-            ge=64,
-            le=1024,
-            description="Height for the generated video.",
-        ),
-        # -------------------------------------------
-        # 4. ADVANCED CONTROLS
-        # -------------------------------------------
-        denoise_strength: float = Input(
-            default=1.0,
-            ge=0.0,
-            le=2.0,
-            description="Controls how strongly noise is applied each step.",
-        ),
-        force_offload: bool = Input(
-            default=True,
-            description="Whether to force model layers offloaded to CPU.",
-        ),
-        # -------------------------------------------
-        # 5. OUTPUT ENCODING
-        # -------------------------------------------
-        frame_rate: int = Input(
-            default=16,
-            ge=1,
-            le=60,
-            description="Video frame rate.",
-        ),
-        crf: int = Input(
-            default=19,
-            ge=0,
-            le=51,
-            description="CRF (quality) for H264 encoding. Lower values = higher quality.",
-        ),
-        # -------------------------------------------
-        # 6. POST-PROCESS ENHANCING
-        # -------------------------------------------
-        enhance_weight: float = Input(
-            default=0.3,
-            ge=0.0,
-            le=2.0,
-            description="Strength of the video enhancement effect.",
-        ),
-        enhance_single: bool = Input(
-            default=True,
-            description="Apply enhancement to individual frames.",
-        ),
-        enhance_double: bool = Input(
-            default=True,
-            description="Apply enhancement across frame pairs.",
-        ),
-        enhance_start: float = Input(
-            default=0.0,
-            ge=0.0,
-            le=1.0,
-            description="When to start enhancement in the video. Must be less than enhance_end.",
-        ),
-        enhance_end: float = Input(
-            default=1.0,
-            ge=0.0,
-            le=1.0,
-            description="When to end enhancement in the video. Must be greater than enhance_start.",
-        ),
-        # -------------------------------------------
-        # 7. REPRODUCIBILITY: SEED
-        # -------------------------------------------
-        seed: int = seed_helper.predict_seed(),
-        replicate_weights: Path = Input(
-            default=None,
-            description="A .tar file containing LoRA weights from replicate.",
-        ),
+            self,
+            # -------------------------------------------
+            # 1. PROMPT & LoRA
+            # -------------------------------------------
+            prompt: str = Input(
+                default="",
+                description="The text prompt describing your video scene.",
+            ),
+            lora_url: str = Input(
+                default="",
+                description="A URL pointing to your LoRA .safetensors file or a Hugging Face repo (e.g. 'user/repo' - uses the first .safetensors file).",
+            ),
+            lora_strength: float = Input(
+                default=1.0,
+                ge=-10.0,
+                le=10.0,
+                description="Scale/strength for your LoRA.",
+            ),
+            lora2_url: str = Input(
+                default="",
+                description="URL or Hugging Face repo for your second LoRA .safetensors file.",
+            ),
+            lora2_strength: float = Input(
+                default=1.0,
+                ge=-10.0,
+                le=10.0,
+                description="Scale/strength for your second LoRA.",
+            ),
+            # -------------------------------------------
+            # 2. SAMPLING CONTROLS
+            # -------------------------------------------
+            scheduler: str = Input(
+                default="DPMSolverMultistepScheduler",
+                choices=[
+                    "FlowMatchDiscreteScheduler",
+                    "SDE-DPMSolverMultistepScheduler",
+                    "DPMSolverMultistepScheduler",
+                    "SASolverScheduler",
+                    "UniPCMultistepScheduler",
+                ],
+                description="Algorithm used to generate the video frames.",
+            ),
+            steps: int = Input(
+                default=50,
+                ge=1,
+                le=150,
+                description="Number of diffusion steps.",
+            ),
+            guidance_scale: float = Input(
+                default=6.0,
+                ge=0.0,
+                le=30.0,
+                description="Overall influence of text vs. model.",
+            ),
+            flow_shift: int = Input(
+                default=9,
+                ge=0,
+                le=20,
+                description="Video continuity factor (flow).",
+            ),
+            # -------------------------------------------
+            # 3. VIDEO DIMENSIONS & FRAMES
+            # -------------------------------------------
+            num_frames: int = Input(
+                default=33,
+                ge=1,
+                le=1440,
+                description="How many frames (duration) in the resulting video.",
+            ),
+            width: int = Input(
+                default=640,
+                ge=64,
+                le=1536,
+                description="Width for the generated video.",
+            ),
+            height: int = Input(
+                default=360,
+                ge=64,
+                le=1024,
+                description="Height for the generated video.",
+            ),
+            # -------------------------------------------
+            # 4. ADVANCED CONTROLS
+            # -------------------------------------------
+            denoise_strength: float = Input(
+                default=1.0,
+                ge=0.0,
+                le=2.0,
+                description="Controls how strongly noise is applied each step.",
+            ),
+            force_offload: bool = Input(
+                default=True,
+                description="Whether to force model layers offloaded to CPU.",
+            ),
+            # -------------------------------------------
+            # 5. OUTPUT ENCODING
+            # -------------------------------------------
+            frame_rate: int = Input(
+                default=16,
+                ge=1,
+                le=60,
+                description="Video frame rate.",
+            ),
+            crf: int = Input(
+                default=19,
+                ge=0,
+                le=51,
+                description="CRF (quality) for H264 encoding. Lower values = higher quality.",
+            ),
+            # -------------------------------------------
+            # 6. POST-PROCESS ENHANCING
+            # -------------------------------------------
+            enhance_weight: float = Input(
+                default=0.3,
+                ge=0.0,
+                le=2.0,
+                description="Strength of the video enhancement effect.",
+            ),
+            enhance_single: bool = Input(
+                default=True,
+                description="Apply enhancement to individual frames.",
+            ),
+            enhance_double: bool = Input(
+                default=True,
+                description="Apply enhancement across frame pairs.",
+            ),
+            enhance_start: float = Input(
+                default=0.0,
+                ge=0.0,
+                le=1.0,
+                description="When to start enhancement in the video. Must be less than enhance_end.",
+            ),
+            enhance_end: float = Input(
+                default=1.0,
+                ge=0.0,
+                le=1.0,
+                description="When to end enhancement in the video. Must be greater than enhance_start.",
+            ),
+            # -------------------------------------------
+            # 7. REPRODUCIBILITY: SEED
+            # -------------------------------------------
+            seed: int = seed_helper.predict_seed(),
+            replicate_weights: Path = Input(
+                default=None,
+                description="A .tar file containing LoRA weights from replicate.",
+            ),
     ) -> Path:
         """
         Create a video using HunyuanVideo with either:
@@ -428,26 +447,38 @@ class Predictor(BasePredictor):
         # 1. Clean up previous runs
         self.comfyUI.cleanup(ALL_DIRECTORIES)
 
-        # 2. Decide how to obtain our LoRA file name
+        # 2. Prepare LoRA files
+        lora_name = ""
+        lora2_name = ""
+
+        # Handle primary LoRA
         if replicate_weights is not None:
             # Use replicate tar (prefer the comfyui version)
             lora_name = self.handle_replicate_weights(replicate_weights)
-        else:
+        elif lora_url:
             # Use the remote url or huggingface repo
-            if not lora_url:
-                raise ValueError(
-                    "No LoRA provided. Provide either replicate_weights tar or a lora_url."
-                )
             lora_name = self.copy_lora_file(lora_url)
+        else:
+            raise ValueError(
+                "No primary LoRA provided. Provide either replicate_weights tar or a lora_url."
+            )
+
+        # Handle secondary LoRA (optional)
+        if lora2_url:
+            lora2_name = self.copy_lora_file(lora2_url)
 
         # 3. Load the updated workflow JSON
         with open(api_json_file, "r") as f:
             workflow = json.loads(f.read())
 
-        # 3a. Zero out node 41 lora so handle_weights won't see it
-        workflow["41"]["inputs"]["lora"] = ""
+        # 3a. Zero out the lora_name fields so handle_weights won't try to download them
+        if "44" in workflow and "inputs" in workflow["44"] and "lora_name" in workflow["44"]["inputs"]:
+            workflow["44"]["inputs"]["lora_name"] = ""
 
-        # 4. Fill in user parameters, skipping the real LoRA name/strength for now
+        if "45" in workflow and "inputs" in workflow["45"] and "lora_name" in workflow["45"]["inputs"]:
+            workflow["45"]["inputs"]["lora_name"] = ""
+
+        # 4. Fill in user parameters - intentionally with blank LoRAs to start
         self.update_workflow(
             workflow=workflow,
             prompt=prompt,
@@ -460,8 +491,10 @@ class Predictor(BasePredictor):
             force_offload=force_offload,
             denoise_strength=denoise_strength,
             num_frames=num_frames,
-            lora_name="",  # intentionally blank
-            lora_strength=0.0,  # skip real strength
+            lora_name="",  # intentionally blank for now
+            lora_strength=lora_strength,
+            lora2_name="",  # intentionally blank for now
+            lora2_strength=lora2_strength,
             frame_rate=frame_rate,
             crf=crf,
             enhance_weight=enhance_weight,
@@ -472,12 +505,18 @@ class Predictor(BasePredictor):
             scheduler=scheduler,
         )
 
-        # 5. Load the workflow -> handle_weights sees lora="", won't attempt a download
+        # 5. Load the workflow -> handle_weights won't attempt downloads with blank lora_name
         wf = self.comfyUI.load_workflow(workflow)
 
-        # 5a. Now set the real LoRA file
-        wf["41"]["inputs"]["lora"] = lora_name
-        wf["41"]["inputs"]["strength"] = lora_strength
+        # 5a. Now set the real LoRA files
+        wf["44"]["inputs"]["lora_name"] = lora_name
+
+        # Set the second LoRA if provided, otherwise keep it blank
+        if lora2_name:
+            wf["45"]["inputs"]["lora_name"] = lora2_name
+        else:
+            # If no second LoRA, set the strength to 0 to minimize its effect
+            wf["45"]["inputs"]["strength"] = 0.0
 
         # 6. Run the workflow
         self.comfyUI.connect()

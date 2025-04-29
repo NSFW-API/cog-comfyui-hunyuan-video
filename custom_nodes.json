@@ -1,7 +1,7 @@
 [
   {
     "repo": "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite",
-    "commit": "6953fa2"
+    "commit": "5e61bcf"
   },
   {
     "repo": "https://github.com/Iemand005/ComfyUI-Touchpad-Gestures",
@@ -10,10 +10,14 @@
   },
   {
     "repo": "https://github.com/kijai/ComfyUI-HunyuanVideoWrapper",
-    "commit": "a66045f"
+    "commit": "1b4164f"
+  },
+  {
+    "repo": "https://github.com/facok/ComfyUI-HunyuanVideoMultiLora",
+    "commit": "d41fbcb"
   },
   {
     "repo": "https://github.com/logtd/ComfyUI-HunyuanLoom",
-    "commit": "0d77f90"
+    "commit": "f5816c4"
   }
 ]
