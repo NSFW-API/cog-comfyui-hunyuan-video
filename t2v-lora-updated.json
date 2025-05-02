@@ -6,7 +6,11 @@
       "quantization": "fp8_e4m3fn",
       "load_device": "offload_device",
       "attention_mode": "sdpa",
-      "auto_cpu_offload": false
+      "auto_cpu_offload": false,
+      "lora": [
+        "43",
+        0
+      ]
     },
     "class_type": "HyVideoModelLoader",
     "_meta": {
@@ -26,7 +30,7 @@
       "denoise_strength": 1,
       "scheduler": "DPMSolverMultistepScheduler",
       "model": [
-        "41",
+        "1",
         0
       ],
       "hyvid_embeds": [
@@ -126,17 +130,12 @@
   },
   "41": {
     "inputs": {
-      "model": [
-        "1",
-        0
-      ],
-      "lora_name": "",
-      "strength": 1.0,
-      "blocks_type": "double_blocks"
+      "lora": "hunyuan-cyberpunk-mod.safetensors",
+      "strength": 1
     },
-    "class_type": "HunyuanVideoLoraLoader",
+    "class_type": "HyVideoLoraSelect",
     "_meta": {
-      "title": "Hunyuan Video LoRA Loader (Primary)"
+      "title": "HunyuanVideo Lora Select (1)"
     }
   },
   "42": {
@@ -154,17 +153,16 @@
   },
   "43": {
     "inputs": {
-      "model": [
+      "lora": "",
+      "strength": 1,
+      "prev_lora": [
         "41",
         0
-      ],
-      "lora_name": "",
-      "strength": 0.5,
-      "blocks_type": "double_blocks"
+      ]
     },
-    "class_type": "HunyuanVideoLoraLoader",
+    "class_type": "HyVideoLoraSelect",
     "_meta": {
-      "title": "Hunyuan Video LoRA Loader (Secondary)"
+      "title": "HunyuanVideo Lora Select (2)"
     }
   }
 }
